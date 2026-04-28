@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # Adjust brightness on the most likely display device.
-# Usage: omarchy-brightness-display <step>
+# Auto-calibrates to the panel's hardware levels so each 1% step is visible.
+# Usage: omarchy-brightness-display <+N%|N%-|N%>
 
-step="${1:-+5%}"
+step="${1:-+1%}"
 
-# Start with the first possible output, then refine to the most likely given an order heuristic.
+# Find the most likely backlight device.
 device="$(ls -1 /sys/class/backlight 2>/dev/null | head -n1)"
 for candidate in amdgpu_bl* intel_backlight acpi_video*; do
   if [[ -e /sys/class/backlight/$candidate ]]; then
@@ -14,8 +15,109 @@ for candidate in amdgpu_bl* intel_backlight acpi_video*; do
   fi
 done
 
-# Set the actual brightness of the display device.
-brightnessctl -d "$device" set "$step" >/dev/null
+sysfs="/sys/class/backlight/$device"
+max=$(cat "$sysfs/max_brightness")
+current=$(cat "$sysfs/brightness")
 
-# Use SwayOSD to display the new brightness setting.
-omarchy-swayosd-brightness "$(brightnessctl -d "$device" -m | cut -d',' -f4 | tr -d '%')"
+# Load or detect the first 6 hardware brightness thresholds (cached per device).
+# Each threshold is the minimum raw value that produces a new visible level,
+# ensuring 0-5% each look distinct on panels with coarse low-end quantization.
+cache="$HOME/.cache/omarchy/brightness-levels-$device"
+
+if [[ -f $cache ]]; then
+  read -ra hw_levels < "$cache"
+else
+  hw_levels=(0)
+  prev_actual=0
+  scan_step=$(( max / 256 ))
+  (( scan_step < 1 )) && scan_step=1
+
+  for (( raw = scan_step; raw <= max && ${#hw_levels[@]} < 6; raw += scan_step )); do
+    brightnessctl -d "$device" set "$raw" >/dev/null 2>&1
+    actual=$(cat "$sysfs/actual_brightness")
+    if (( actual > prev_actual )); then
+      lo=$(( raw - scan_step ))
+      hi=$raw
+      threshold=$raw
+      while (( lo <= hi )); do
+        mid=$(( (lo + hi) / 2 ))
+        brightnessctl -d "$device" set "$mid" >/dev/null 2>&1
+        actual=$(cat "$sysfs/actual_brightness")
+        if (( actual > prev_actual )); then
+          threshold=$mid
+          hi=$(( mid - 1 ))
+        else
+          lo=$(( mid + 1 ))
+        fi
+      done
+      hw_levels+=("$threshold")
+      brightnessctl -d "$device" set "$threshold" >/dev/null 2>&1
+      prev_actual=$(cat "$sysfs/actual_brightness")
+    fi
+  done
+
+  brightnessctl -d "$device" set "$current" >/dev/null 2>&1
+  mkdir -p "$HOME/.cache/omarchy"
+  echo "${hw_levels[*]}" > "$cache"
+fi
+
+hw_count=${#hw_levels[@]}
+last_idx=$(( hw_count - 1 ))
+
+# Perceptual mapping: 0-(hw_count-1)% use exact hardware thresholds so each
+# step is a distinct visible level. hw_count-100% interpolate linearly.
+raw_to_percent() {
+  local raw=$1
+
+  if (( raw >= hw_levels[last_idx] )); then
+    local base=${hw_levels[last_idx]}
+    local range=$(( max - base ))
+    local pct_range=$(( 100 - last_idx ))
+    if (( range <= 0 )); then echo 100; return; fi
+    local pct=$(( last_idx + ((raw - base) * pct_range + range / 2) / range ))
+    (( pct > 100 )) && pct=100
+    echo "$pct"
+    return
+  fi
+
+  for (( i = last_idx; i >= 0; i-- )); do
+    if (( raw >= hw_levels[i] )); then
+      echo "$i"
+      return
+    fi
+  done
+  echo 0
+}
+
+percent_to_raw() {
+  local pct=$1
+  (( pct <= 0 )) && { echo 0; return; }
+  (( pct >= 100 )) && { echo "$max"; return; }
+  if (( pct <= last_idx )); then
+    echo "${hw_levels[$pct]}"
+    return
+  fi
+  local base=${hw_levels[last_idx]}
+  local range=$(( max - base ))
+  local pct_range=$(( 100 - last_idx ))
+  echo $(( base + (pct - last_idx) * range / pct_range ))
+}
+
+# Parse step: +N% (up), N%- (down), or N% (absolute).
+if [[ $step =~ ^\+([0-9]+)% ]]; then
+  current_pct=$(raw_to_percent "$current")
+  new_pct=$(( current_pct + BASH_REMATCH[1] ))
+elif [[ $step =~ ^([0-9]+)%- ]]; then
+  current_pct=$(raw_to_percent "$current")
+  new_pct=$(( current_pct - BASH_REMATCH[1] ))
+else
+  new_pct="${step%%%}"
+fi
+
+(( new_pct > 100 )) && new_pct=100
+(( new_pct < 0 )) && new_pct=0
+
+new_raw=$(percent_to_raw "$new_pct")
+brightnessctl -d "$device" set "$new_raw" >/dev/null
+
+omarchy-swayosd-brightness "$new_pct"
